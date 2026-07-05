@@ -2,6 +2,32 @@
 
 When the candidate pastes a job (text or URL), ALWAYS deliver the 7 blocks (A-F evaluation + G legitimacy):
 
+## Liveness gate (URL inputs)
+
+When the candidate pastes a **URL** (not JD text), confirm the posting is still live before doing any evaluation. A dead link must never reach Block A — a 404/expired page wastes a full A-G evaluation, report, and PDF on phantom content.
+
+1. Get the page content: if you arrived here from `auto-pipeline` (its Step 0.5 already navigated and cleared the link), reuse that snapshot — do not navigate again. On a direct URL entry, navigate with Playwright (`browser_navigate` + `browser_snapshot`) and read the title, URL, and visible content.
+2. Classify the posting:
+   - **active posting evidence:** title/role + a real job description or an application/apply path
+   - **closed posting evidence:** expired/closed/"no longer accepting applications", missing JD with only nav/footer, hard redirect to a generic careers/search page, or 404/410
+3. If the posting appears closed, **stop before Block A**: tell the candidate the link is dead, and if the entry came from `data/pipeline.md`, mark it `- [x] ~~Company | Role~~ — oferta nieaktywna`. Do not generate an evaluation, report, or CV.
+4. If the candidate pasted JD text (no URL), liveness cannot be verified — note that and proceed; there is no link to check.
+
+Do not continue to Block A until this gate is resolved. The snapshot captured here is reused by Block G's freshness signals.
+
+## Bounded Research Budget
+
+Company, compensation, and hiring-signal research must be a single-pass lookup, not an open-ended investigation. This mode is an evaluation workflow, not deep company research.
+
+Hard limits for Blocks D and G combined:
+- hard cap: 5 total WebSearch queries
+- Prefer targeted queries that answer more than one question; stop early when enough evidence exists.
+- Do not invoke `deep-research`, `deep`, or any other research skill.
+- Do not spawn subagents or delegate research to another agent.
+- Do not continue researching after the query cap is reached; summarize the evidence found and explicitly mark missing data as unavailable.
+
+If deeper company research is useful, recommend running `/career-ops deep` separately after the evaluation.
+
 ## Step 0 — Archetype Detection
 
 Classify the job into one of the 6 archetypes (see `_shared.md`). If it is a hybrid, indicate the 2 closest ones. This determines:
@@ -19,6 +45,21 @@ Table with:
 - Remote (full/hybrid/onsite)
 - Team size (if mentioned)
 - TL;DR in 1 sentence
+
+### Geo-mismatch check
+
+After filling the Remote row, cross-check the posting's **structured location field** (the location/remote designation shown on the posting page or in ATS metadata — not the Remote row you just wrote) against the JD body:
+
+- **Contradiction** = the location field says remote, but the JD body states a **binding attendance requirement**: "hybrid", "X days per week/month" in office, "in-office", "onsite"/"on-site", mandatory office attendance, or a relocation requirement.
+- **Not a contradiction:** negations ("no onsite requirement"), optional or occasional in-person events ("quarterly offsites", "optional co-working space"), or generic benefits boilerplate.
+- If the JD body says nothing about location or attendance, emit no flag — silence is absence of signal, not agreement.
+- If the input has no structured location field (pasted JD text only), skip this check.
+
+On contradiction, add exactly one flag line at the top of Block B in the report, quoting the evidence **verbatim** (never paraphrase):
+
+`⚠️ **Geo-mismatch:** location field says remote, but JD body says "{verbatim JD line}"`
+
+The flag is an additive line only — Block B's existing content stays unchanged below it, and no flag line appears when there is no contradiction.
 
 ## Block B — Match with CV
 
@@ -46,7 +87,7 @@ Read `cv.md`. Create a table with each JD requirement mapped to exact lines in t
 
 ## Block D — Comp and Demand
 
-Use WebSearch for:
+Use the bounded research budget above for:
 - Current salaries for the role (Glassdoor, Levels.fyi, Blind)
 - Company's compensation reputation
 - Demand trend for the role
@@ -93,7 +134,7 @@ Analyze the job posting for signals that indicate whether this is a real, active
 
 ### Signals to analyze (in order):
 
-**1. Posting Freshness** (from Playwright snapshot, already captured in Step 0):
+**1. Posting Freshness** (from the Playwright snapshot captured during the liveness gate, or in `auto-pipeline` Step 0; unavailable if only JD text was pasted):
 - Date posted or "X days ago" -- extract from page
 - Apply button state (active / closed / missing / redirects to generic page)
 - If URL redirected to generic careers page, note it
@@ -107,7 +148,7 @@ Analyze the job posting for signals that indicate whether this is a real, active
 - What ratio of the JD is role-specific vs generic boilerplate?
 - Any internal contradictions? (entry-level title + staff requirements, etc.)
 
-**3. Company Hiring Signals** (2-3 WebSearch queries, combine with Block D research):
+**3. Company Hiring Signals** (use remaining queries from the bounded research budget, combine with Block D research):
 - Search: `"{company}" layoffs {year}` -- note date, scale, departments
 - Search: `"{company}" hiring freeze {year}` -- note any announcements
 - If layoffs found: are they in the same department as this role?
@@ -142,6 +183,63 @@ Analyze the job posting for signals that indicate whether this is a real, active
 
 ---
 
+## Cover Letter Draft (auto-generated after Block G)
+
+After saving the report and recording in the tracker, append a cover letter draft to the report file under `## Cover Letter Draft`. This is a starting point — not the final letter. The user completes it via `/career-ops cover {slug}`.
+
+**How to generate the draft:**
+
+1. Read `cv.md` — select 4 achievement bullets most relevant to the JD's top requirements (exact wording, real metrics only)
+2. Read `config/profile.yml` — extract candidate name, current role, years of experience
+3. Write a 2-sentence opening based on the role title and JD mission language
+4. Write a 1-paragraph profile intro from the cv.md summary, adapted to the JD domain
+5. Leave the "Problems / Why this company / Approach" section as a placeholder — this requires user input
+6. Detect and flag any gaps (domain mismatch, language requirement, start date urgency) so the user sees them immediately
+
+**Draft format to append to the report:**
+
+```markdown
+## Cover Letter Draft
+
+> Draft generated at evaluation time. Complete via `/career-ops cover {slug}` to fill in angles, confirm research, and generate the PDF.
+> Gaps flagged below — address them during the cover flow.
+
+---
+
+**Opening** *(placeholder — refine with your "why this role" angle)*
+{2-sentence opening based on JD role title and mission language}
+
+**Profile introduction**
+{1 paragraph from cv.md summary, adapted to JD domain and required competencies}
+
+**Key achievements** *(selected from cv.md — exact wording preserved)*
+- **{lead from cv.md},** {impact sentence with metric}.
+- **{lead from cv.md},** {impact sentence with metric}.
+- **{lead from cv.md},** {impact sentence with metric}.
+- **{lead from cv.md},** {impact sentence with metric}.
+
+**Problems I will solve** *(placeholder — requires company research + your input)*
+> To be completed: what challenges does {company} face that you'd address? How would you approach them?
+
+**Closing**
+I am happy to discuss further at your convenience.
+
+---
+
+**Gaps flagged:**
+{List any detected gaps — domain mismatch, language requirement, start date urgency, title mismatch. If none, write "None detected."}
+
+**JD keywords to mirror** *(extracted for ATS + human read)*
+{8-10 exact phrases from the JD}
+
+---
+*Run `/career-ops cover {slug}` to complete angles, confirm company research, and generate the PDF.*
+```
+
+Apply all language rules from `_shared.md` Professional Writing section to the draft content. No em dashes, no buzzwords, active voice, concrete claims only.
+
+---
+
 ## Post-evaluation
 
 **ALWAYS** after generating blocks A-G:
@@ -150,7 +248,7 @@ Analyze the job posting for signals that indicate whether this is a real, active
 
 Save full evaluation in `reports/{###}-{company-slug}-{YYYY-MM-DD}.md`.
 
-- `{###}` = next sequential number (3 digits, zero-padded)
+- `{###}` = next sequential number (3 digits, zero-padded). To allocate it atomically and prevent race conditions, you MUST run `node reserve-report-num.mjs` to claim the number (stdout returns `{###}`), write the report, and then run `node reserve-report-num.mjs --release {###}` to release the sentinel.
 - `{company-slug}` = company name in lowercase, without spaces (use hyphens)
 - `{YYYY-MM-DD}` = current date
 
@@ -208,7 +306,7 @@ Save full evaluation in `reports/{###}-{company-slug}-{YYYY-MM-DD}.md`.
 - Score: match average (1-5)
 - Status: `Evaluated`
 - PDF: ❌ (or ✅ if auto-pipeline generated PDF)
-- Report: link relative to the report .md (e.g., `[001](reports/001-company-2026-01-01.md)`)
+- Report: root-relative link `[001](reports/001-company-2026-01-01.md)` (when merged via `merge-tracker.mjs` it is normalized to be relative to the tracker's own dir, e.g. `../reports/...`; see #760)
 
 **Tracker format:**
 
