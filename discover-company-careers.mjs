@@ -3,8 +3,14 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
+import {
+  buildLocationFilter,
+  buildTitleFilter,
+  evaluateCompany,
+  normalizeKeywordList,
+} from './lib/company-discovery.mjs';
 
-import { parseAtsSlug } from './verify-portals.mjs';
+import { deriveSlugCandidates, parseAtsSlug, probeSlug } from './verify-portals.mjs';
 
 const DUMPS_DIR = path.resolve('data/company-dumps');
 const PORTALS_PATH = path.resolve('portals.yml');
@@ -24,6 +30,9 @@ function parseArgs(argv) {
     company: '',
     concurrency: 6,
     allOpenings: false,
+    allCompanies: false,
+    verbose: false,
+    noBrowser: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -36,56 +45,14 @@ function parseArgs(argv) {
     else if (arg === '--company') args.company = argv[++i] || '';
     else if (arg === '--concurrency') args.concurrency = Number(argv[++i] || args.concurrency);
     else if (arg === '--all-openings') args.allOpenings = true;
+    else if (arg === '--all-companies') args.allCompanies = true;
+    else if (arg === '--verbose') args.verbose = true;
+    else if (arg === '--no-browser') args.noBrowser = true;
   }
 
   return args;
 }
 
-function normalizeKeywordList(value) {
-  if (value == null) return [];
-  const arr = Array.isArray(value) ? value : [value];
-  return arr
-    .filter(v => typeof v === 'string')
-    .map(v => v.toLowerCase().trim())
-    .filter(Boolean);
-}
-
-function buildTitleFilter(titleFilter) {
-  const positive = normalizeKeywordList(titleFilter?.positive);
-  const negative = normalizeKeywordList(titleFilter?.negative);
-
-  return (title) => {
-    const lower = String(title || '').toLowerCase();
-    if (!lower) return false;
-    const hasPositive = positive.length === 0 || positive.some(k => lower.includes(k));
-    const hasNegative = negative.some(k => lower.includes(k));
-    return hasPositive && !hasNegative;
-  };
-}
-
-function buildLocationFilter(locationFilter) {
-  if (!locationFilter) return () => true;
-  const alwaysAllow = normalizeKeywordList(locationFilter.always_allow);
-  const allow = normalizeKeywordList(locationFilter.allow);
-  const block = normalizeKeywordList(locationFilter.block);
-
-  return (location) => {
-    if (typeof location !== 'string' || location.trim() === '') return true;
-    const lower = location.toLowerCase();
-    if (alwaysAllow.length > 0 && alwaysAllow.some(k => lower.includes(k))) return true;
-    if (block.length > 0 && block.some(k => lower.includes(k))) return false;
-    if (allow.length === 0) return true;
-    return allow.some(k => lower.includes(k));
-  };
-}
-
-function slugify(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80);
-}
 
 function loadPortalsConfig() {
   if (!existsSync(PORTALS_PATH)) throw new Error('portals.yml not found');
@@ -115,15 +82,6 @@ function loadDumpItems(filePath) {
   return [];
 }
 
-function extractLocation(company) {
-  const hq = Array.isArray(company?.hq_locations) ? company.hq_locations : [];
-  const first = hq.find(loc => loc?.is_headquarters) || hq[0];
-  if (!first) return '';
-  const city = first?.city?.name || '';
-  const country = first?.country?.name || '';
-  return [city, country].filter(Boolean).join(', ');
-}
-
 function getCompanySummary(company) {
   const parts = [];
   if (company?.tagline) parts.push(company.tagline);
@@ -134,37 +92,7 @@ function getCompanySummary(company) {
   return parts.join(' | ');
 }
 
-function evaluateCompany(company, titleFilter, locationFilter) {
-  const roles = Array.isArray(company?.job_roles) ? company.job_roles.filter(Boolean) : [];
-  const location = extractLocation(company);
-  const matchingRoles = roles.filter(role => titleFilter(role) && locationFilter(location));
-  const locationPass = locationFilter(location);
-
-  const totalJobs = Number(company?.total_jobs_available || 0);
-  const hasOpeningsSignal = totalJobs > 0 || roles.length > 0;
-  const relevance =
-    matchingRoles.length > 0 ? 'direct-role-match'
-      : hasOpeningsSignal && locationPass ? 'check-manually'
-        : 'low-priority';
-
-  return {
-    name: company?.name || 'Unknown',
-    slug: slugify(company?.name || company?.path || company?.uuid || 'company'),
-    location,
-    matchingRoles,
-    allRoles: roles,
-    totalJobs,
-    relevance,
-    summary: getCompanySummary(company),
-    linkedin: company?.linkedin_url || '',
-    careersHint: company?.linkedin_url || '',
-    websitePath: company?.path || '',
-    employees: company?.employees || '',
-    sourceUuid: company?.uuid || '',
-  };
-}
-
-function loadRelevantCompanies(config, section, includeManual, companyFilter = '', allOpenings = false) {
+function loadRelevantCompanies(config, section, includeManual, companyFilter = '', allOpenings = false, allCompanies = false) {
   if (!existsSync(DUMPS_DIR)) throw new Error(`Dump directory not found: ${DUMPS_DIR}`);
 
   const titleFilter = buildTitleFilter(config?.title_filter);
@@ -186,7 +114,15 @@ function loadRelevantCompanies(config, section, includeManual, companyFilter = '
         const rawName = normalizeName(company?.name || company?.path || company?.uuid || '');
         if (!rawName.includes(normalizedCompanyFilter)) continue;
       }
-      evaluated.push(evaluateCompany(company, titleFilter, locationFilter));
+      evaluated.push({
+        ...evaluateCompany(company, titleFilter, locationFilter),
+        summary: getCompanySummary(company),
+        linkedin: company?.linkedin_url || '',
+        careersHint: company?.linkedin_url || '',
+        websitePath: company?.path || '',
+        employees: company?.employees || '',
+        sourceUuid: company?.uuid || '',
+      });
     }
   }
 
@@ -198,14 +134,18 @@ function loadRelevantCompanies(config, section, includeManual, companyFilter = '
     return true;
   });
 
+  if (allCompanies) {
+    return deduped.filter(item => item.discoveryEligible);
+  }
+
   if (allOpenings) {
-    return deduped.filter(item => item.totalJobs > 0 || item.allRoles.length > 0);
+    return deduped.filter(item => item.hasOpeningsSignal);
   }
 
   return deduped.filter(item => {
-    if (section === 'all') return item.relevance !== 'low-priority';
-    if (section === 'manual') return item.relevance === 'check-manually';
-    if (includeManual) return item.relevance !== 'low-priority';
+    if (section === 'all') return item.discoveryEligible;
+    if (section === 'manual') return item.relevance === 'check-manually' || item.relevance === 'no-current-fit';
+    if (includeManual) return item.hasOpeningsSignal;
     return item.relevance === 'direct-role-match';
   });
 }
@@ -235,11 +175,18 @@ function buildAtsApiUrl(careersUrl) {
   return null;
 }
 
-function buildPortalEntry(companyName, careersUrl, sourceLabel) {
+function buildAtsCareersUrl(ats, slug) {
+  if (ats === 'greenhouse') return `https://job-boards.greenhouse.io/${slug}`;
+  if (ats === 'ashby') return `https://jobs.ashbyhq.com/${slug}`;
+  if (ats === 'lever') return `https://jobs.lever.co/${slug}`;
+  return null;
+}
+
+function buildPortalEntry(companyName, careersUrl, notes) {
   const entry = {
     name: companyName,
     careers_url: careersUrl,
-    notes: `Discovered from ${sourceLabel} on ${today()}.`,
+    notes,
     enabled: true,
   };
   const api = buildAtsApiUrl(careersUrl);
@@ -263,6 +210,17 @@ function appendPortalEntries(fileText, entries) {
   const addition = entries.map(serializePortalEntry).join('\n\n');
   const trimmed = fileText.replace(/\s*$/, '');
   return `${trimmed}\n\n${addition}\n`;
+}
+
+function createLogger(verbose) {
+  return {
+    info(companyName, message) {
+      console.log(`[${companyName}] ${message}`);
+    },
+    detail(companyName, message) {
+      if (verbose) console.log(`[${companyName}] ${message}`);
+    },
+  };
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
@@ -362,8 +320,10 @@ function normalizeUrl(url) {
   }
 }
 
-async function searchCompany(companyName) {
+async function searchCompany(companyName, { allowBrowser = true, verbose = false } = {}) {
+  let browserNoticeShown = false;
   async function searchWithPlaywright(queryText) {
+    if (!allowBrowser) return [];
     const { chromium } = await import('playwright');
     const browser = await chromium.launch({ headless: true });
     try {
@@ -392,6 +352,9 @@ async function searchCompany(companyName) {
     ];
     const rawLinks = [];
     for (const queryText of queries) {
+      if (verbose) {
+        console.log(`[${companyName}] search query: ${queryText}`);
+      }
       let links = [];
       try {
         const query = encodeURIComponent(queryText);
@@ -404,7 +367,14 @@ async function searchCompany(companyName) {
         links = [];
       }
       if (links.length === 0) {
+        if (verbose && !allowBrowser && !browserNoticeShown) {
+          console.log(`[${companyName}] DDG HTML search returned no links; browser fallback disabled`);
+          browserNoticeShown = true;
+        }
         links = await searchWithPlaywright(queryText);
+        if (verbose && links.length > 0) {
+          console.log(`[${companyName}] browser search fallback returned ${links.length} link(s)`);
+        }
       }
       rawLinks.push(...links);
     }
@@ -522,7 +492,8 @@ async function extractLinksWithPlaywright(url) {
   }
 }
 
-async function findCareersLink(companyUrl) {
+async function findCareersLink(companyUrl, { allowBrowser = true, verbose = false, companyName = '' } = {}) {
+  let browserNoticeShown = false;
   try {
     const { text } = await fetchHtml(companyUrl);
     const links = [];
@@ -547,6 +518,14 @@ async function findCareersLink(companyUrl) {
     // fall through to browser rendering
   }
 
+  if (!allowBrowser) {
+    if (verbose && !browserNoticeShown) {
+      console.log(`[${companyName || companyUrl}] browser fallback disabled`);
+      browserNoticeShown = true;
+    }
+    return null;
+  }
+
   try {
     const links = await extractLinksWithPlaywright(companyUrl);
     for (const link of links) {
@@ -563,31 +542,60 @@ async function findCareersLink(companyUrl) {
   }
 }
 
-async function discoverCareersUrl(companyName) {
-  const candidates = await searchCompany(companyName);
+async function discoverCareersUrl(companyName, { allowBrowser = true, verbose = false } = {}) {
+  const logger = createLogger(verbose);
+  const slugs = deriveSlugCandidates(companyName).slice(0, 8);
+  const atsOrder = ['greenhouse', 'ashby', 'lever'];
+
+  logger.info(companyName, `ATS-first probing${allowBrowser ? '' : ' (browser disabled)'}`);
+  for (const slug of slugs) {
+    for (const ats of atsOrder) {
+      const probe = await probeSlug(ats, slug);
+      logger.detail(companyName, `ATS probe ${ats}/${slug} -> ${probe.status}${probe.jobCount != null ? ` (${probe.jobCount} jobs)` : ''}`);
+      if (probe.status !== 'live' && probe.status !== 'empty') continue;
+      const url = buildAtsCareersUrl(ats, slug);
+      if (!url) continue;
+      const note = `Discovered via ATS-first probe (${ats}/${slug}, ${probe.status}${probe.jobCount != null ? `, ${probe.jobCount} jobs` : ''}) on ${today()}.`;
+      logger.info(companyName, `ATS hit: ${url}`);
+      return {
+        url,
+        source: `ATS-first probe (${ats}/${slug})`,
+        notes: note,
+      };
+    }
+  }
+
+  logger.info(companyName, 'No ATS hit; searching the public web');
+  const candidates = await searchCompany(companyName, { allowBrowser, verbose });
   for (const candidate of candidates) {
     if (!isSupportedPortalUrl(candidate.url)) continue;
     const verdict = await verifyUrl(candidate.url);
+    logger.detail(companyName, `Search candidate ${candidate.url} -> ${verdict.status}`);
     if (verdict.status === 'careers-page') return candidate.url;
     if (verdict.status !== 'dead' && verdict.status !== 'error') {
+      if (!allowBrowser) continue;
+      logger.detail(companyName, `Browser verify ${candidate.url}`);
       const browserVerdict = await verifyUrlWithPlaywright(candidate.url);
       if (browserVerdict.status === 'careers-page') return candidate.url;
     }
   }
   for (const candidate of candidates) {
     const verdict = await verifyUrl(candidate.url);
+    logger.detail(companyName, `Fallback candidate ${candidate.url} -> ${verdict.status}`);
     if (verdict.status === 'linkedin-company') continue;
     if (verdict.status === 'linkedin-jobs') return candidate.url;
     if (verdict.status === 'careers-page') return candidate.url;
     if (verdict.status === 'company-page') {
-      const linked = await findCareersLink(candidate.url);
+      const linked = await findCareersLink(candidate.url, { allowBrowser, verbose, companyName });
       if (linked) return linked;
     }
     if (verdict.status === 'uncertain' || verdict.status === 'company-page') {
+      if (!allowBrowser) continue;
+      logger.detail(companyName, `Browser fallback for ${candidate.url}`);
       const browserVerdict = await verifyUrlWithPlaywright(candidate.url);
       if (browserVerdict.status === 'careers-page') return candidate.url;
       if (browserVerdict.status === 'company-page') {
-        const linked = await findCareersLink(candidate.url);
+        const linked = await findCareersLink(candidate.url, { allowBrowser, verbose, companyName });
         if (linked) return linked;
       }
     }
@@ -638,7 +646,8 @@ async function main() {
   const config = loadPortalsConfig();
   const existingKeys = loadExistingPortalKeys(config);
   const sourceLabel = args.source === 'startup-map-berlin' ? 'Startup Map Berlin' : args.source;
-  const relevant = loadRelevantCompanies(config, args.section, args.includeManual, args.company, args.allOpenings)
+  const allowBrowser = !args.noBrowser;
+  const relevant = loadRelevantCompanies(config, args.section, args.includeManual, args.company, args.allOpenings, args.allCompanies)
     .slice(0, args.limit === Infinity ? undefined : args.limit);
 
   if (relevant.length === 0) {
@@ -646,18 +655,23 @@ async function main() {
     return;
   }
 
+  console.log(`Discovery mode: ATS-first${allowBrowser ? ' + browser fallback' : ' only'}. Companies: ${relevant.length}.`);
   const results = await mapWithConcurrency(relevant, args.concurrency, async (company) => {
     const key = normalizeName(company.name);
     if (existingKeys.has(key)) {
       return { status: 'skipped', name: company.name, reason: 'already tracked' };
     }
 
-    const careersUrl = await withTimeout(discoverCareersUrl(company.name), 25000, company.name).catch(() => null);
-    if (!careersUrl) {
+    const discovery = await withTimeout(
+      discoverCareersUrl(company.name, { allowBrowser, verbose: args.verbose }),
+      25000,
+      company.name,
+    ).catch(() => null);
+    if (!discovery?.url) {
       return { status: 'skipped', name: company.name, reason: 'no confident careers page found' };
     }
 
-    const entry = buildPortalEntry(company.name, careersUrl, sourceLabel);
+    const entry = buildPortalEntry(company.name, discovery.url, discovery.notes || `Discovered from ${sourceLabel} on ${today()}.`);
     const entryKey = normalizeName(entry.name);
     const urlKey = normalizeName(entry.careers_url);
     if (existingKeys.has(entryKey) || existingKeys.has(urlKey)) {
@@ -666,7 +680,7 @@ async function main() {
 
     existingKeys.add(entryKey);
     existingKeys.add(urlKey);
-    return { status: 'found', entry };
+    return { status: 'found', entry, source: discovery.source || sourceLabel };
   });
 
   const found = results.filter(x => x?.status === 'found').map(x => x.entry);
@@ -674,7 +688,11 @@ async function main() {
 
   mkdirSync(OUT_DIR, { recursive: true });
   const reportPath = path.join(OUT_DIR, `company-career-discovery-${today()}.md`);
-  writeFileSync(reportPath, renderReport(found, skipped), 'utf-8');
+  const reportItems = results.filter(x => x?.status === 'found').map(x => ({
+    ...x.entry,
+    source: x.source,
+  }));
+  writeFileSync(reportPath, renderReport(reportItems, skipped), 'utf-8');
   console.log(`Wrote ${reportPath}`);
 
   if (args.write && found.length > 0) {
