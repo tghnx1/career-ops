@@ -43,7 +43,7 @@ function main() {
 
   run('node', fetchArgs);
   run('node', ['scan-company-dumps.mjs', '--write']);
-  run('node', ['discover-company-careers.mjs', '--write', '--all-openings']);
+  run('node', ['discover-company-careers.mjs', '--write', '--all-companies', '--no-browser', '--verbose']);
   run('node', ['build-company-review-queue.mjs']);
   run('node', ['enrich-company-review-queue.mjs', '--limit', '8']);
   run('node', ['build-tracker-candidate-queue.mjs']);
