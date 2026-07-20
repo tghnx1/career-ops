@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for claude -p workers
-# Reads batch-input.tsv, delegates each offer to a claude -p worker,
+# career-ops batch runner — standalone orchestrator for headless AI CLI workers
+# Reads batch-input.tsv, delegates each offer to a worker CLI,
 # tracks state in batch-state.tsv for resumability.
 #
-# NOTE: This script is Claude Code-specific. It uses claude -p with
-# --dangerously-skip-permissions and --append-system-prompt-file flags
-# that are not available in other CLIs. Multi-CLI support is out of scope
-# for now — contributions welcome.
+# Default worker CLI is OpenCode if available, otherwise Claude Code.
+# Set BATCH_CLI=claude or BATCH_CLI=opencode to override.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -33,12 +31,13 @@ RETRY_FAILED=false
 START_FROM=0
 MAX_RETRIES=2
 MIN_SCORE=0
-MODEL=""  # empty = let claude -p use the Claude Max default
+MODEL=""
+BATCH_CLI="${BATCH_CLI:-auto}"
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via claude -p workers
-Uses your default Claude model (Claude Max subscription).
+career-ops batch runner — process job offers in batch via headless CLI workers
+Uses OpenCode by default when available, otherwise Claude Code.
 
 Usage: batch-runner.sh [OPTIONS]
 
@@ -49,9 +48,9 @@ Options:
   --start-from N       Start from offer ID N (skip earlier IDs)
   --max-retries N      Max retry attempts per offer (default: 2)
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
-  --model NAME         Claude model passed to `claude -p --model` (default:
-                       unset = Claude Max default). Use a cheaper model for
-                       large batches, e.g. `--model claude-sonnet-4-6`.
+  --model NAME         Worker model name. For OpenCode use provider/model,
+                       for Claude Code use the Claude model name.
+  --cli NAME           Worker CLI to use: auto | opencode | claude (default: auto)
   -h, --help           Show this help
 
 Files:
@@ -86,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --min-score) MIN_SCORE="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --cli) BATCH_CLI="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
@@ -129,10 +129,34 @@ check_prerequisites() {
     exit 1
   fi
 
-  if ! command -v claude &>/dev/null; then
-    echo "ERROR: 'claude' CLI not found in PATH."
-    exit 1
-  fi
+  case "$BATCH_CLI" in
+    auto)
+      if command -v opencode &>/dev/null; then
+        BATCH_CLI="opencode"
+      elif command -v claude &>/dev/null; then
+        BATCH_CLI="claude"
+      else
+        echo "ERROR: neither 'opencode' nor 'claude' CLI found in PATH."
+        exit 1
+      fi
+      ;;
+    opencode)
+      if ! command -v opencode &>/dev/null; then
+        echo "ERROR: 'opencode' CLI not found in PATH."
+        exit 1
+      fi
+      ;;
+    claude)
+      if ! command -v claude &>/dev/null; then
+        echo "ERROR: 'claude' CLI not found in PATH."
+        exit 1
+      fi
+      ;;
+    *)
+      echo "ERROR: invalid BATCH_CLI value '$BATCH_CLI'. Use auto, opencode, or claude."
+      exit 1
+      ;;
+  esac
 
   mkdir -p "$LOGS_DIR" "$TRACKER_DIR" "$REPORTS_DIR"
 }
@@ -327,6 +351,7 @@ process_offer() {
   local date
   date=$(date +%Y-%m-%d)
   local jd_file="/tmp/batch-jd-${id}.txt"
+  : > "$jd_file"
 
   echo "--- Processing offer #$id: $url (report $report_num, attempt $((retries + 1)))"
 
@@ -360,17 +385,28 @@ process_offer() {
     -e "s|{{ID}}|${esc_id}|g" \
     "$PROMPT_FILE" > "$resolved_prompt"
 
-  # Launch claude -p worker.
-  # Model defaults to the Claude Max subscription default unless --model was
-  # passed. Building the command in an array keeps quoting safe regardless.
-  local -a claude_args=(-p --dangerously-skip-permissions)
-  if [[ -n "$MODEL" ]]; then
-    claude_args+=(--model "$MODEL")
-  fi
-  claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
-
+  # Launch worker CLI.
+  # OpenCode is the preferred default because it works without a Claude login.
   local exit_code=0
-  claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+  if [[ "$BATCH_CLI" == "opencode" ]]; then
+    local worker_message
+    worker_message=$(cat "$resolved_prompt")
+    local -a opencode_args=(run --format json --dangerously-skip-permissions)
+    if [[ -n "$MODEL" ]]; then
+      opencode_args+=(--model "$MODEL")
+    else
+      opencode_args+=(--model "opencode/deepseek-v4-flash-free")
+    fi
+    opencode_args+=(--dir "$PROJECT_DIR" "$worker_message")
+    opencode "${opencode_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+  else
+    local -a claude_args=(-p --dangerously-skip-permissions)
+    if [[ -n "$MODEL" ]]; then
+      claude_args+=(--model "$MODEL")
+    fi
+    claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
+    claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+  fi
 
   # Cleanup resolved prompt
   rm -f "$resolved_prompt"
